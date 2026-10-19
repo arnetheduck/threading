@@ -116,7 +116,7 @@ runnableExamples("--threads:on --gc:orc"):
 when not (defined(gcArc) or defined(gcOrc) or defined(gcAtomicArc) or defined(nimdoc)):
   {.error: "This module requires one of --mm:arc / --mm:atomicArc / --mm:orc compilation flags".}
 
-import std/[locks, isolation, atomics]
+import std/[locks, isolation, atomics, typetraits]
 
 # Channel
 # ------------------------------------------------------------------------------
@@ -169,6 +169,12 @@ template closedForReceiving(chan: ChannelRaw): bool =
 
 # Channels memory ops
 # ------------------------------------------------------------------------------
+
+type
+  # Only ever called with a callback that runs `=destroy` on the value, which
+  # does not trigger a GC cycle under the arc/orc/atomicArc memory management
+  # modes this module supports, so the indirect call is GC-safe.
+  DestroyCallback = proc(p: pointer) {.gcsafe.} ## Destroys the value at `p`
 
 proc allocChannel(size, n: int): ChannelRaw =
   result = cast[ChannelRaw](allocShared(sizeof(ChannelObj)))
@@ -260,7 +266,13 @@ proc channelSend(chan: ChannelRaw, data: pointer, size: int, blocking: static bo
   release(chan.lock)
   result = true
 
-proc channelReceive(chan: ChannelRaw, data: pointer, size: int, blocking: static bool): bool =
+proc channelReceive(
+    chan: ChannelRaw,
+    data: pointer,
+    size: int,
+    blocking: static bool,
+    destroyDst: DestroyCallback,
+): bool =
   assert not chan.isNil
   assert not data.isNil
 
@@ -289,6 +301,11 @@ proc channelReceive(chan: ChannelRaw, data: pointer, size: int, blocking: static
       chan.getTail()
     else:
       chan.getTail() - chan.slots
+
+  # Destroy the previous value of `data` before overwriting it with the
+  # received message.
+  if destroyDst != nil:
+    destroyDst(data)
 
   copyMem(data, chan.buffer[readIdx * size].addr, size)
 
@@ -485,8 +502,16 @@ proc tryRecv*[T](r: Receiver[T], dst: var T): bool {.inline.} =
   ##    operations.
   ##
   ## Returns `false` and does not change `dst` if no message was received,
-  ## including when the channel is closed and fully drained.
-  channelReceive(r.d, dst.addr, sizeof(T), false)
+  ## including when the channel is closed and fully drained. When a message is
+  ## received, the previous value of `dst` is destroyed before being
+  ## overwritten.
+  when supportsCopyMem(T):
+    channelReceive(r.d, dst.addr, sizeof(T), false, nil)
+  else:
+    proc destroy(p: pointer) =
+      `=destroy`(cast[ptr T](p)[])
+
+    channelReceive(r.d, dst.addr, sizeof(T), false, destroy)
 
 proc recv*[T](r: Receiver[T], dst: var T): bool {.inline.} =
   ## Receives a message from the channel `r` and fill `dst` with its value.
@@ -500,18 +525,25 @@ proc recv*[T](r: Receiver[T], dst: var T): bool {.inline.} =
   ## Returns `true` if a message was received. If the channel is closed for
   ## sending (all senders are gone) and fully drained, `dst` is filled with
   ## `default(T)` and `false` is returned.
-  result = channelReceive(r.d, dst.addr, sizeof(T), true)
-  if not result:
-    dst = default(T)
 
-proc recv*[T](r: Receiver[T]): T {.inline.} =
+  # Because we unconditionally return an item, we can destroy the previous value
+  # of `dst` before overwriting it with the received message.
+  `=destroy`(dst)
+  result = channelReceive(r.d, dst.addr, sizeof(T), true, nil)
+  if not result:
+    const tmp = default(T)
+    copyMem(result.addr, tmp.addr, sizeof(T))
+
+proc recv*[T](r: Receiver[T]): T {.inline, noinit.} =
   ## Receives a message from the channel `r`.
   ## A version of `recv`_ that returns the message.
   ##
   ## If the channel is closed (all senders are gone) and fully drained,
   ## `default(T)` is returned.
-  if not channelReceive(r.d, result.addr, sizeof(T), true):
-    result = default(T)
+  # `result` is default-initialized, so no destructor callback is needed.
+  if not channelReceive(r.d, result.addr, sizeof(T), true, nil):
+    const tmp = default(T)
+    copyMem(result.addr, tmp.addr, sizeof(T))
 
 proc recvIso*[T](r: Receiver[T]): Isolated[T] {.inline.} =
   ## Receives a message from the channel `r`.
@@ -519,7 +551,8 @@ proc recvIso*[T](r: Receiver[T]): Isolated[T] {.inline.} =
   ##
   ## If the channel is closed (all senders are gone) and fully drained,
   ## `default(T)` is returned.
-  if not channelReceive(r.d, result.addr, sizeof(T), true):
+  # `result` is default-initialized, so no destructor callback is needed.
+  if not channelReceive(r.d, result.addr, sizeof(T), true, nil):
     result = isolate(default(T))
 
 proc closed*[T](s: Receiver[T]): bool {.inline.} =
@@ -601,4 +634,5 @@ proc recvIso*[T](c: Channel[T]): Isolated[T] {.deprecated, inline.} =
 proc peek*[T](c: Channel[T]): int {.deprecated, inline.} =
   ## Deprecated in 0.3.0: no replacement
   c.sender.d.numItems()
+
 {.pop.}

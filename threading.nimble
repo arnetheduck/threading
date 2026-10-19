@@ -7,4 +7,5 @@ license       = "MIT"
 
 # Dependencies
 
-requires "nim >= 2.0.0"
+# `createShared` unusable in earlier releases: https://github.com/nim-lang/Nim/issues/26014
+requires "nim >= 2.2.12"

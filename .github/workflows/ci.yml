@@ -86,12 +86,6 @@ jobs:
             nim_branch: version-2-2
             builder: windows-2025
 
-          # The oldest line still built by nightlies, kept as the floor check.
-          - os: linux
-            cpu: amd64
-            nim_branch: version-2-0
-            builder: ubuntu-24.04
-
     name: '${{ matrix.target.os }}-${{ matrix.target.cpu }}-nim-${{ matrix.target.nim_branch }} (${{ matrix.branch }})'
     runs-on: ${{ matrix.target.builder }}
     steps:
